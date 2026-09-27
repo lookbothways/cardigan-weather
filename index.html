@@ -76,7 +76,7 @@ const STEP = +(P.get('step') || 0.125);
 const HOUR_MS = +(P.get('speed') || 1000);    // playback time per forecast hour
 const FPS = +(P.get('fps') || 24);
 const MODEL = P.get('model') || '';
-const HOURS = 24, U = 6, REFRESH_MIN = 90;
+const HOURS = 24, U = 6, REFRESH_MIN = 60;
 const TOWNS = [
   ['Cardigan', 52.083, -4.661], ['Aberystwyth', 52.415, -4.083], ['Lampeter', 52.113, -4.080],
   ['Carmarthen', 51.857, -4.312], ["St David's", 51.882, -5.269], ['Pembroke', 51.676, -4.915],
@@ -299,13 +299,13 @@ fetch('https://cdn.jsdelivr.net/npm/world-atlas@2/land-10m.json')
   .then(topo => { land = topojson.feature(topo, topo.objects.land); setupProjection(); draw(t); })
   .catch(() => {});
 
-// ---- Forecast (cached; refreshed hourly and only while visible) ----
+// ---- Forecast (cached within the clock hour; refreshed hourly and only while visible) ----
 const CACHE_KEY = 'rainloop3:' + [CENTER, STEP, MODEL].join('|');
 async function load(force) {
   try {
     if (!force) {
       const c = JSON.parse(localStorage.getItem(CACHE_KEY) || 'null');
-      if (c && Date.now() - c.at < 80 * 60e3) { render(c.data); return; }
+      if (c && Date.now() - c.at < 60 * 60e3 && new Date(c.at).getHours() === new Date().getHours()) { render(c.data); return; }
     }
   } catch (e) {}
   const url = 'https://api.open-meteo.com/v1/forecast?latitude=' + pts.map(p => p[0]).join(',') +
@@ -328,7 +328,12 @@ async function load(force) {
 
 if (matchMedia('(prefers-reduced-motion: reduce)').matches) pause();
 load();
-setInterval(() => { if (document.visibilityState === 'visible') load(); }, REFRESH_MIN * 60e3);
+// Refresh 2 minutes past every hour so the loop always starts at the current hour
+(function scheduleHourly() {
+  const now = new Date(), next = new Date(now);
+  next.setHours(now.getHours() + 1, 2, 0, 0);
+  setTimeout(() => { if (document.visibilityState === 'visible') load(); scheduleHourly(); }, next - now);
+})();
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') load(); });
 </script>
 </body>
