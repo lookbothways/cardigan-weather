@@ -1,0 +1,336 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Cardigan rainfall – next 24 hours</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.9.0/d3.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/topojson/3.0.2/topojson.min.js"></script>
+<style>
+  :root { --sea:#17212b; --land:#272d33; --coast:#56626e; --fg:#f2f4f6; --muted:#aab3bd;
+          --red:#c8102e; }
+  html, body { height:100%; margin:0; background:var(--sea); color:var(--fg); overflow:hidden;
+    font:14px/1.3 Roboto, "Segoe UI", system-ui, sans-serif; }
+  #map { cursor:grab; touch-action:none; }
+  #map:active { cursor:grabbing; }
+  #clock { position:absolute; top:max(8px, env(safe-area-inset-top)); left:14px; z-index:2; pointer-events:none;
+    display:grid; grid-template-columns:2ch auto; align-items:baseline; column-gap:.1em;
+    font:300 clamp(48px, 18vmin, 140px)/1 Roboto, "Segoe UI", system-ui, sans-serif;
+    color:#fff; letter-spacing:-.02em; font-variant-numeric:tabular-nums; font-feature-settings:"tnum"; }
+  #clock .day { grid-column:1 / -1; font-size:.4em; font-weight:500; letter-spacing:.04em; margin-top:.15em; }
+  #clock .num { text-align:right; }
+  #clock small { font-size:.4em; font-weight:400; }
+  #map { position:absolute; inset:0; width:100%; height:100%; display:block; }
+  .land { fill:var(--land); }
+  .coast { fill:none; stroke:var(--coast); stroke-width:1; }
+  #rain { opacity:.82; }
+  .town text { fill:#fff; font-weight:600; text-anchor:middle; paint-order:stroke;
+    stroke:rgba(0,0,0,.75); stroke-width:3px; stroke-linejoin:round; }
+  .town .sub { font-weight:500; font-size:12px; }
+  .town circle { fill:#fff; }
+  #bar { position:absolute; left:0; right:0; bottom:0; z-index:2; padding:56px 16px 12px;
+    background:linear-gradient(transparent, rgba(0,0,0,.55));
+    display:grid; grid-template-columns:auto 1fr auto; gap:8px 14px; align-items:center; }
+  #play { width:28px; height:28px; padding:0; border:0; background:none; color:#fff;
+    font-size:16px; cursor:pointer; display:grid; place-items:center; }
+  #play:focus-visible, #scrub:focus-visible { outline:1px solid #fff; outline-offset:4px; }
+  #scrub { -webkit-appearance:none; appearance:none; width:100%; height:18px; margin:0; background:none; cursor:pointer; --p:0%; }
+  #scrub::-webkit-slider-runnable-track { height:2px; border-radius:1px;
+    background:linear-gradient(90deg, #fff var(--p), rgba(255,255,255,.28) var(--p)); }
+  #scrub::-moz-range-track { height:2px; border-radius:1px; background:rgba(255,255,255,.28); }
+  #scrub::-moz-range-progress { height:2px; background:#fff; }
+  #scrub::-webkit-slider-thumb { -webkit-appearance:none; width:12px; height:12px; margin-top:-5px; border-radius:50%; background:#fff; border:0; }
+  #scrub::-moz-range-thumb { width:12px; height:12px; border-radius:50%; background:#fff; border:0; }
+  #track { position:relative; }
+  #chart { position:absolute; left:0; bottom:9px; width:100%; height:clamp(14px, 5.1vmin, 40px); pointer-events:none; }
+  #scrub { position:relative; }
+  #time { font-weight:400; min-width:6.5em; text-align:right; font-variant-numeric:tabular-nums; }
+  #legend { grid-column:1 / -1; display:flex; align-items:center; gap:10px; font-size:10px; color:var(--muted); }
+  #ramp { display:flex; flex:1; }
+  #ramp span { flex:1; border-top:4px solid; padding-top:3px; }
+  #msg { position:absolute; top:10px; left:50%; transform:translateX(-50%); z-index:2;
+    background:rgba(0,0,0,.6); padding:6px 12px; border-radius:8px; display:none; }
+</style>
+</head>
+<body>
+<svg id="map"><rect id="sea" width="100%" height="100%" fill="var(--sea)"/><g id="world"><path class="land"/><g id="rain"></g><path class="coast"/><g id="towns"></g></g></svg>
+<!-- Forecast data: Open-Meteo (CC BY 4.0). Coastline: Natural Earth. -->
+<div id="clock"></div>
+<div id="msg"></div>
+<div id="bar">
+  <button id="play" aria-label="Pause">❚❚</button>
+  <div id="track"><canvas id="chart"></canvas><input id="scrub" type="range" min="0" max="23" step="0.01" value="0" aria-label="Forecast hour"></div>
+  <div id="time">–</div>
+  <div id="legend"><span>mm/h</span><div id="ramp"></div></div>
+</div>
+
+<script>
+// ---- Settings (URL overrides: ?lat=52.09&lon=-4.55&step=0.125&speed=1000&fps=24&model=ukmo_seamless) ----
+const P = new URLSearchParams(location.search);
+const CENTER = [+(P.get('lat') || 52.083), +(P.get('lon') || -4.661)];   // Cardigan
+const VIEW_LAT = 0.475, VIEW_LON = 0.875;     // initial view half-spans
+const HALF_LAT = VIEW_LAT + 0.25, HALF_LON = VIEW_LON + 0.4;   // data area: + ~Cardigan→Fishguard each side
+const STEP = +(P.get('step') || 0.125);
+const HOUR_MS = +(P.get('speed') || 1000);    // playback time per forecast hour
+const FPS = +(P.get('fps') || 24);
+const MODEL = P.get('model') || '';
+const HOURS = 24, U = 6, REFRESH_MIN = 90;
+const TOWNS = [
+  ['Cardigan', 52.083, -4.661], ['Aberystwyth', 52.415, -4.083], ['Lampeter', 52.113, -4.080],
+  ['Carmarthen', 51.857, -4.312], ["St David's", 51.882, -5.269], ['Pembroke', 51.676, -4.915],
+  ['Swansea', 51.621, -3.944], ['Fishguard', 51.994, -4.976], ['New Quay', 52.214, -4.358],
+];
+const BANDS = [
+  [0.1, '#4f8fe6'], [0.3, '#3a6fe0'], [0.7, '#2bb3b0'], [1.5, '#5cc84a'],
+  [3, '#e8d23a'], [6, '#f0913a'], [12, '#dc3d6e'], [24, '#a34ad6'],
+];
+
+// ---- Grid ----
+const lat0 = CENTER[0] - HALF_LAT, lat1 = CENTER[0] + HALF_LAT;
+const lon0 = CENTER[1] - HALF_LON, lon1 = CENTER[1] + HALF_LON;
+const rows = Math.round((lat1 - lat0) / STEP) + 1, cols = Math.round((lon1 - lon0) / STEP) + 1;
+const pts = [];
+for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++)
+  pts.push([+(lat1 - r * STEP).toFixed(3), +(lon0 + c * STEP).toFixed(3)]);
+TOWNS.forEach(t => pts.push([t[1], t[2]]));
+const GW = (cols - 1) * U + 1, GH = (rows - 1) * U + 1, N = GW * GH;
+const KM_PX_Y = STEP / U * 111.32, KM_PX_X = KM_PX_Y * Math.cos(CENTER[0] * Math.PI / 180);
+
+// ---- Legend ----
+document.getElementById('ramp').innerHTML =
+  BANDS.map(([v, c]) => `<span style="border-color:${c}">${v}</span>`).join('');
+
+// ---- Projection: initial view cover-fits the view box around Cardigan; drag pans within the data area ----
+const svg = d3.select('#map'), world = d3.select('#world');
+let proj, W, H, land = null;
+const zoom = d3.zoom().scaleExtent([1, 1]).filter(e => e.type !== 'wheel' && !e.button)
+  .on('zoom', e => world.attr('transform', e.transform));
+svg.call(zoom).on('dblclick.zoom', null);
+function setupProjection() {
+  W = innerWidth; H = innerHeight;
+  proj = d3.geoMercator().center([CENTER[1], CENTER[0]]).translate([W / 2, H / 2]).scale(1);
+  const view = { type:'MultiPoint', coordinates:[[CENTER[1] - VIEW_LON, CENTER[0] - VIEW_LAT], [CENTER[1] + VIEW_LON, CENTER[0] + VIEW_LAT]] };
+  const b = d3.geoPath(proj).bounds(view);
+  proj.scale(Math.max(W / (b[1][0] - b[0][0]), H / (b[1][1] - b[0][1])));
+  // Pan limits = data area, inset one coarse cell so blurred edges stay hidden
+  const tl = proj([lon0 + STEP, lat1 - STEP]), br = proj([lon1 - STEP, lat0 + STEP]);
+  const ext = [[Math.min(tl[0], 0), Math.min(tl[1], 0)], [Math.max(br[0], W), Math.max(br[1], H)]];
+  proj.clipExtent([[ext[0][0] - 20, ext[0][1] - 20], [ext[1][0] + 20, ext[1][1] + 20]]);
+  zoom.extent([[0, 0], [W, H]]).translateExtent(ext);
+  svg.call(zoom.transform, d3.zoomIdentity);
+  if (land) {
+    const path = d3.geoPath(proj);
+    svg.select('.land').attr('d', path(land));
+    svg.select('.coast').attr('d', path(land));
+  }
+}
+setupProjection();
+
+// ---- Field helpers ----
+function upsample(g) {                         // coarse grid -> fine grid (bilinear)
+  const f = new Float32Array(N);
+  for (let y = 0; y < GH; y++) {
+    const gy = y / U, r0 = Math.min(Math.floor(gy), rows - 2), fy = gy - r0;
+    for (let x = 0; x < GW; x++) {
+      const gx = x / U, c0 = Math.min(Math.floor(gx), cols - 2), fx = gx - c0, i = r0 * cols + c0;
+      f[y * GW + x] = (g[i] * (1 - fx) + g[i + 1] * fx) * (1 - fy) + (g[i + cols] * (1 - fx) + g[i + cols + 1] * fx) * fy;
+    }
+  }
+  return f;
+}
+function blur(f) {                             // 3x box blur ~ gaussian
+  const t = new Float32Array(N);
+  for (let pass = 0; pass < 3; pass++) {
+    for (let y = 0; y < GH; y++) for (let x = 0; x < GW; x++) {
+      let s = 0, n = 0;
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        const yy = y + dy, xx = x + dx;
+        if (yy >= 0 && yy < GH && xx >= 0 && xx < GW) { s += f[yy * GW + xx]; n++; }
+      }
+      t[y * GW + x] = s / n;
+    }
+    f.set(t);
+  }
+  return f;
+}
+function sample(f, x, y) {                     // bilinear sample with edge clamp
+  x = Math.max(0, Math.min(GW - 1.001, x)); y = Math.max(0, Math.min(GH - 1.001, y));
+  const x0 = x | 0, y0 = y | 0, fx = x - x0, fy = y - y0, i = y0 * GW + x0;
+  return (f[i] * (1 - fx) + f[i + 1] * fx) * (1 - fy) + (f[i + GW] * (1 - fx) + f[i + GW + 1] * fx) * fy;
+}
+
+// ---- Wind-advected interpolation between hours ----
+// For fraction s between hour h and h+1, each pixel samples hour h upwind by s*displacement
+// and hour h+1 downwind by (1-s)*displacement, then blends. Rain appears to travel with the wind.
+let F = [], DX = [], DY = [];
+const OUT = new Float32Array(N);
+function fieldAt(t) {
+  const h = Math.min(Math.floor(t), F.length - 1), s = t - h;
+  if (h >= F.length - 1 || s < 1e-3) return F[h];
+  const A = F[h], B = F[h + 1], dx = DX[h], dy = DY[h], s1 = 1 - s;
+  for (let y = 0, i = 0; y < GH; y++) for (let x = 0; x < GW; x++, i++) {
+    OUT[i] = s1 * sample(A, x - dx[i] * s, y - dy[i] * s) + s * sample(B, x + dx[i] * s1, y + dy[i] * s1);
+  }
+  return OUT;
+}
+const contourGen = d3.contours().size([GW, GH]).smooth(true).thresholds(BANDS.map(b => b[0]));
+function toScreen([x, y]) { return proj([lon0 + (x - 0.5) / U * STEP, lat1 - (y - 0.5) / U * STEP]); }
+function contourPath(mp) {
+  let s = '';
+  for (const poly of mp.coordinates) for (const ring of poly) {
+    ring.forEach((p, i) => { const [x, y] = toScreen(p); s += (i ? 'L' : 'M') + x.toFixed(1) + ',' + y.toFixed(1); });
+    s += 'Z';
+  }
+  return s;
+}
+
+// ---- State ----
+let times = [], townTemps = [], townRain = [], t = 0, playing = true, raf = 0;
+const $ = id => document.getElementById(id);
+const msg = m => { $('msg').textContent = m || ''; $('msg').style.display = m ? 'block' : 'none'; };
+
+function render(data) {
+  const grid = data.slice(0, rows * cols), towns = data.slice(rows * cols);
+  times = grid[0].hourly.time.slice(0, HOURS);
+  const n = times.length;
+  F = times.map((_, h) => blur(upsample(grid.map(p => p.hourly.precipitation[h] || 0))));
+  // Steering wind (850 hPa, km/h, direction it blows FROM), averaged over each hour pair -> pixels/hour
+  const uv = h => grid.map(p => {
+    const S = p.hourly.wind_speed_850hPa[h] || 0, d = (p.hourly.wind_direction_850hPa[h] || 0) * Math.PI / 180;
+    return [-S * Math.sin(d), -S * Math.cos(d)];      // east, north
+  });
+  const UV = times.map((_, h) => uv(h));
+  DX = []; DY = [];
+  for (let h = 0; h < n - 1; h++) {
+    DX.push(upsample(UV[h].map((a, i) => (a[0] + UV[h + 1][i][0]) / 2 / KM_PX_X)));
+    DY.push(upsample(UV[h].map((a, i) => -(a[1] + UV[h + 1][i][1]) / 2 / KM_PX_Y)));
+  }
+  townTemps = towns.map(p => p.hourly.temperature_2m);
+  townRain = towns.map(p => p.hourly.precipitation);
+  $('scrub').max = n - 1;
+  drawChart();
+  t = Math.min(t, n - 1);
+  draw(t);
+  if (playing) play();
+}
+
+function draw(tt) {
+  if (!F.length) return;
+  d3.select('#rain').selectAll('path').data(contourGen(fieldAt(tt))).join('path')
+    .attr('fill', (d, i) => BANDS[i][1]).attr('d', contourPath);
+  $('scrub').value = tt;
+  $('scrub').style.setProperty('--p', (tt / Math.max(1, F.length - 1) * 100) + '%');
+  const h = Math.floor(tt), when = new Date(Date.parse(times[h]) + (tt - h) * 3600e3);
+  when.setMinutes(Math.round(when.getMinutes() / 10) * 10);
+  $('time').textContent = when.toLocaleDateString('en-GB', { weekday:'short' }) + ' ' +
+    when.toLocaleTimeString('en-GB', { hour:'2-digit', minute:'2-digit' });
+  const hr = Math.round(tt);
+  const H24 = +times[hr].slice(11, 13), h12 = H24 % 12 || 12;
+  const day = new Date(times[hr]).toLocaleDateString('en-GB', { weekday:'short' }).toUpperCase();
+  $('clock').innerHTML = `<span class="num">${h12}</span><small>${H24 < 12 ? 'am' : 'pm'}</small><span class="day">${day}</span>`;
+  const g = d3.select('#towns').selectAll('g.town').data(TOWNS).join(enter => {
+    const e = enter.append('g').attr('class', 'town');
+    e.append('circle').attr('r', 2.5);
+    e.append('text').attr('class', 'name').attr('y', -8);
+    e.append('text').attr('class', 'sub').attr('y', 16);
+    return e;
+  });
+  g.attr('transform', d => `translate(${proj([d[2], d[1]])})`);
+  g.select('.name').text(d => d[0]);
+  g.select('.sub').text((d, i) => {
+    const tp = townTemps[i][hr], r = townRain[i][hr];
+    return `${Math.round(tp)}°` + (r >= 0.1 ? ` · ${r.toFixed(1)}mm` : '');
+  });
+}
+
+// ---- Playback ----
+let lastTs = 0, lastDraw = 0, hold = 0;
+function loop(ts) {
+  if (!playing) return;
+  const dt = lastTs ? Math.min(ts - lastTs, 200) : 0; lastTs = ts;
+  const end = F.length - 1;
+  if (hold > 0) { hold -= dt; if (hold <= 0) t = 0; }
+  else { t += dt / HOUR_MS; if (t >= end) { t = end; hold = HOUR_MS * 2; } }
+  if (ts - lastDraw >= 1000 / FPS) { draw(t); lastDraw = ts; }
+  raf = requestAnimationFrame(loop);
+}
+function play() {
+  cancelAnimationFrame(raf); playing = true; lastTs = 0;
+  $('play').textContent = '❚❚'; $('play').setAttribute('aria-label', 'Pause');
+  raf = requestAnimationFrame(loop);
+}
+function pause() {
+  cancelAnimationFrame(raf); playing = false;
+  $('play').textContent = '▶'; $('play').setAttribute('aria-label', 'Play');
+}
+$('play').onclick = () => playing ? pause() : play();
+$('scrub').oninput = e => { pause(); t = +e.target.value; draw(t); };
+addEventListener('resize', () => { setupProjection(); draw(t); drawChart(); });
+
+// ---- Hourly chart along the slider (Cardigan): blue = rain, orange = temperature, added together ----
+function drawChart() {
+  const cv = $('chart'), rain = townRain[0], temp = townTemps[0];
+  if (!rain) return;
+  const dpr = devicePixelRatio || 1, w = cv.clientWidth, h = cv.clientHeight;
+  cv.width = w * dpr; cv.height = h * dpr;
+  const ctx = cv.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.lineCap = 'round'; ctx.lineWidth = 4;
+  const n = rain.length, tMin = Math.min(...temp), tMax = Math.max(...temp);
+  const base = h - 3, top = 2, span = base - top, thumb = 6;
+  const bar = (x, v, colour) => {
+    ctx.strokeStyle = colour; ctx.beginPath();
+    ctx.moveTo(x, base); ctx.lineTo(x, base - Math.max(0, Math.min(1, v)) * span); ctx.stroke();
+  };
+  for (let i = 0; i < n; i++) {
+    const x = thumb + i / Math.max(1, n - 1) * (w - 2 * thumb);
+    bar(x, Math.log1p(rain[i]) / Math.log1p(8), 'rgb(0,150,255)');                           // rain, log scale to 8 mm/h
+    bar(x, tMax > tMin ? (temp[i] - tMin) / (tMax - tMin) : 0.5, 'rgb(255,110,0)');        // temp, relative to the day's range
+  }
+}
+
+// ---- Coastline (Natural Earth 1:10m via world-atlas) ----
+fetch('https://cdn.jsdelivr.net/npm/world-atlas@2/land-10m.json')
+  .then(r => r.json())
+  .then(topo => { land = topojson.feature(topo, topo.objects.land); setupProjection(); draw(t); })
+  .catch(() => {});
+
+// ---- Forecast (cached; refreshed hourly and only while visible) ----
+const CACHE_KEY = 'rainloop3:' + [CENTER, STEP, MODEL].join('|');
+async function load(force) {
+  try {
+    if (!force) {
+      const c = JSON.parse(localStorage.getItem(CACHE_KEY) || 'null');
+      if (c && Date.now() - c.at < 80 * 60e3) { render(c.data); return; }
+    }
+  } catch (e) {}
+  const url = 'https://api.open-meteo.com/v1/forecast?latitude=' + pts.map(p => p[0]).join(',') +
+    '&longitude=' + pts.map(p => p[1]).join(',') +
+    '&hourly=precipitation,temperature_2m,wind_speed_850hPa,wind_direction_850hPa' +
+    '&forecast_hours=' + HOURS + '&timezone=Europe%2FLondon' + (MODEL ? '&models=' + MODEL : '');
+  try {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(res.status);
+    let data = await res.json();
+    if (!Array.isArray(data)) data = [data];
+    msg('');
+    try { localStorage.setItem(CACHE_KEY, JSON.stringify({ at: Date.now(), data })); } catch (e) {}
+    render(data);
+  } catch (e) {
+    msg('Forecast unavailable from Open-Meteo. Retrying in 5 minutes.');
+    setTimeout(() => load(true), 5 * 60e3);
+  }
+}
+
+if (matchMedia('(prefers-reduced-motion: reduce)').matches) pause();
+load();
+setInterval(() => { if (document.visibilityState === 'visible') load(); }, REFRESH_MIN * 60e3);
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') load(); });
+</script>
+</body>
+</html>
