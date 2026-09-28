@@ -23,6 +23,7 @@
   #clock .day { grid-column:2; white-space:nowrap; font-size:.4em; font-weight:500; letter-spacing:.04em; margin-top:.15em; }
   #clock .num { text-align:right; }
   #clock small { font-size:.4em; font-weight:400; }
+  #clock .wet { grid-column:2; white-space:nowrap; font-size:.2em; font-weight:500; letter-spacing:.04em; margin-top:.3em; }
   #map { position:absolute; inset:0; width:100%; height:100%; display:block; }
   .land { fill:var(--land); }
   .coast { fill:none; stroke:var(--coast); stroke-width:1; }
@@ -187,7 +188,7 @@ function contourPath(mp) {
 }
 
 // ---- State ----
-let times = [], townTemps = [], townRain = [], t = 0, playing = true, raf = 0;
+let times = [], townTemps = [], townRain = [], wetLine = '', t = 0, playing = true, raf = 0;
 const $ = id => document.getElementById(id);
 const msg = m => { $('msg').textContent = m || ''; $('msg').style.display = m ? 'block' : 'none'; };
 
@@ -209,6 +210,11 @@ function render(data) {
   }
   townTemps = towns.map(p => p.hourly.temperature_2m);
   townRain = towns.map(p => p.hourly.precipitation);
+  // Share of the next 24h with rain over Cardigan; "storm" if any hour carries a thunderstorm code (95–99)
+  const cr = townRain[0], cc = towns[0].hourly.weather_code || [];
+  const wetHours = cr.filter(r => r >= 0.1).length, pct = Math.round(wetHours / cr.length * 100);
+  const storm = cc.some(c => c >= 95);
+  wetLine = pct > 0 ? `${pct}% ${storm ? 'storm' : 'rain'}` : '';
   $('scrub').max = n - 1;
   drawChart();
   t = Math.min(t, n - 1);
@@ -229,7 +235,7 @@ function draw(tt) {
   const hr = Math.round(tt);
   const H24 = +times[hr].slice(11, 13), h12 = H24 % 12 || 12;
   const day = new Date(times[hr]).toLocaleDateString('en-GB', { weekday:'short' }).toUpperCase();
-  $('clock').innerHTML = `<span class="num">${h12}</span><small>${H24 < 12 ? 'am' : 'pm'}</small><span class="day">${day}</span>`;
+  $('clock').innerHTML = `<span class="num">${h12}</span><small>${H24 < 12 ? 'am' : 'pm'}</small><span class="day">${day}</span>${wetLine ? `<span class="wet">${wetLine}</span>` : ''}`;
   const g = d3.select('#towns').selectAll('g.town').data(TOWNS).join(enter => {
     const e = enter.append('g').attr('class', 'town');
     e.append('circle').attr('r', 2.5);
@@ -300,7 +306,7 @@ fetch('https://cdn.jsdelivr.net/npm/world-atlas@2/land-10m.json')
   .catch(() => {});
 
 // ---- Forecast (cached within the clock hour; refreshed hourly and only while visible) ----
-const CACHE_KEY = 'rainloop3:' + [CENTER, STEP, MODEL].join('|');
+const CACHE_KEY = 'rainloop4:' + [CENTER, STEP, MODEL].join('|');
 async function load(force) {
   try {
     if (!force) {
@@ -310,7 +316,7 @@ async function load(force) {
   } catch (e) {}
   const url = 'https://api.open-meteo.com/v1/forecast?latitude=' + pts.map(p => p[0]).join(',') +
     '&longitude=' + pts.map(p => p[1]).join(',') +
-    '&hourly=precipitation,temperature_2m,wind_speed_850hPa,wind_direction_850hPa' +
+    '&hourly=precipitation,temperature_2m,weather_code,wind_speed_850hPa,wind_direction_850hPa' +
     '&forecast_hours=' + HOURS + '&timezone=Europe%2FLondon' + (MODEL ? '&models=' + MODEL : '');
   try {
     const res = await fetch(url);
