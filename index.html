@@ -108,11 +108,12 @@ const FPS = +(P.get('fps') || 24);
 const MODEL = P.get('model') || '';
 const HOURS = 24, FETCH_HOURS = 30, STALE_MS = 3 * 3600e3;
 const VIEW_LAT = 0.475, VIEW_LON = 0.875;     // initial view half-spans around the chosen place
-const STEP = 0.125;                           // forecast grid spacing (degrees)
+const STEP = 0.2;                             // forecast grid spacing (degrees)
 // Fixed UK-wide grid, fetched lazily in tiles as the view moves
-const LAT_MAX = 61, LAT_MIN = 49.75, LON_MIN = -9, LON_MAX = 2;
+const LAT_MAX = 61, LAT_MIN = 49.8, LON_MIN = -9, LON_MAX = 2;
 const ROWS = Math.round((LAT_MAX - LAT_MIN) / STEP) + 1, COLS = Math.round((LON_MAX - LON_MIN) / STEP) + 1, NG = ROWS * COLS;
-const TR = 8, TC = 12;                        // tile size in grid cells (1° x 1.5°)
+const TR = 5, TC = 8;                         // tile size in grid cells (1° x 1.6°) = 54 points
+const BUDGET_PER_MIN = 580;                   // stay just under Open-Meteo's free limit of 600 location-calls a minute
 const TROWS = Math.ceil((ROWS - 1) / TR), TCOLS = Math.ceil((COLS - 1) / TC);
 const BANDS = [
   [0.1, '#4f8fe6'], [0.3, '#3a6fe0'], [0.7, '#2bb3b0'], [1.5, '#5cc84a'],
@@ -158,7 +159,7 @@ const latOf = r => +(LAT_MAX - r * STEP).toFixed(3), lonOf = c => +(LON_MIN + c 
 
 // ---- Tiles ----
 const tiles = new Map();                       // "i,j" -> { state, at, t0, nh, p, t, u, v, retry }
-const TILE_KEY = 'rt6:';
+const TILE_KEY = 'rt7:';
 function tilePts(i, j) {
   const r0 = i * TR, r1 = Math.min(ROWS - 1, r0 + TR), c0 = j * TC, c1 = Math.min(COLS - 1, c0 + TC), pts = [];
   for (let r = r0; r <= r1; r++) for (let c = c0; c <= c1; c++) pts.push([r, c]);
@@ -189,8 +190,9 @@ async function fetchTile(key) {
     '&longitude=' + pts.map(p => lonOf(p[1])).join(',') +
     '&hourly=precipitation,temperature_2m,wind_speed_850hPa,wind_direction_850hPa' +
     '&forecast_hours=' + FETCH_HOURS + '&timeformat=unixtime' + (MODEL ? '&models=' + MODEL : '');
+  spent.push([Date.now(), pts.length]);
   const res = await fetch(url);
-  if (!res.ok) throw new Error(res.status);
+  if (!res.ok) { let reason = ''; try { reason = (await res.json()).reason || ''; } catch (e) {} throw Object.assign(new Error(reason), { status:res.status }); }
   let data = await res.json(); if (!Array.isArray(data)) data = [data];
   const t0 = data[0].hourly.time[0], nh = data[0].hourly.time.length, d = { at:Date.now(), t0, nh, p:[], t:[], u:[], v:[] };
   data.forEach(pt => {
@@ -203,23 +205,38 @@ async function fetchTile(key) {
   });
   return d;
 }
-let active = 0;
-const queue = [];
+// Paced queue: one request at a time, staying under the per-minute allowance; backs off if the API says no
+let active = 0, pausedUntil = 0, pumpTimer = 0;
+const queue = [], spent = [];                  // spent: [time, locations] for the last minute
 function pump() {
-  while (active < 2 && queue.length) {
-    const key = queue.shift(), d = tiles.get(key);
-    if (d && d.state === 'loading') continue;
-    tiles.set(key, Object.assign(d || {}, { state:'loading' }));
-    active++;
-    fetchTile(key).then(nd => {
-      tiles.set(key, Object.assign(nd, { state:'ok' }));
-      store.set(TILE_KEY + key, nd);
-      fillTile(key); msg(''); redraw(); chooseLabels();
-    }).catch(() => {
-      const od = tiles.get(key); od.state = 'err'; od.retry = Date.now() + 5 * 60e3;
+  clearTimeout(pumpTimer);
+  if (active || !queue.length) return;
+  const now = Date.now();
+  while (spent.length && now - spent[0][0] > 60e3) spent.shift();
+  const used = spent.reduce((a, s) => a + s[1], 0);
+  const wait = Math.max(pausedUntil - now, used + (TR + 1) * (TC + 1) > BUDGET_PER_MIN && spent.length ? spent[0][0] + 60e3 - now : 0);
+  if (wait > 0) { pumpTimer = setTimeout(pump, wait + 50); return; }
+  const key = queue.shift(), d = tiles.get(key);
+  if (d && d.state === 'loading') return pump();
+  tiles.set(key, Object.assign(d || {}, { state:'loading' }));
+  active++;
+  fetchTile(key).then(nd => {
+    tiles.set(key, Object.assign(nd, { state:'ok' }));
+    store.set(TILE_KEY + key, nd);
+    fillTile(key); msg(''); redraw(); chooseLabels();
+  }).catch(e => {
+    const od = tiles.get(key); od.state = 'err';
+    if (e.status === 429) {                    // rate limited: wait for the window named in the reason, then carry on
+      const r = e.message || '', next = new Date();
+      if (/daily/i.test(r)) { next.setHours(24, 1, 0, 0); } else if (/hourly/i.test(r)) { next.setHours(next.getHours() + 1, 1, 0, 0); } else next.setTime(Date.now() + 65e3);
+      pausedUntil = next.getTime(); od.retry = pausedUntil;
+      queue.unshift(key);
+      msg('Open-Meteo usage limit reached – more rain data loads at ' + next.toLocaleTimeString('en-GB', { hour:'2-digit', minute:'2-digit' }) + '.');
+    } else {
+      od.retry = Date.now() + 5 * 60e3;
       msg('Forecast unavailable from Open-Meteo. Retrying in 5 minutes.');
-    }).finally(() => { active--; pump(); });
-  }
+    }
+  }).finally(() => { active--; pump(); });
 }
 function needTiles() {
   // Visible area (+ a small margin) in grid rows/cols -> tile indices
@@ -245,6 +262,8 @@ function needTiles() {
     }
     if (!queue.includes(key)) queue.push(key);
   }
+  // drop queued tiles that have scrolled out of view, keep the order nearest-first
+  queue.splice(0, queue.length, ...want.filter(k => queue.includes(k)));
   pump();
 }
 // Drop cached tiles older than 6h and caches from earlier versions
@@ -452,7 +471,7 @@ function pause() {
   draw(t);
 }
 $('play').onclick = () => playing ? pause() : play();
-$('scrub').oninput = e => { pause(); t = +e.target.value; draw(t); };
+$('scrub').oninput = e => { t = +e.target.value; pause(); };   // read first: pause() redraws and would reset the slider
 addEventListener('resize', () => { setupProjection(); drawChart(); });
 
 // ---- Hourly chart along the slider (chosen place): blue = rain, orange = temperature, added together ----
